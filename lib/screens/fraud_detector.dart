@@ -1,10 +1,8 @@
 import 'dart:io';
-import 'dart:typed_data';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
-import 'package:tflite_flutter/tflite_flutter.dart';
-import 'package:image/image.dart' as img;
+import 'package:http/http.dart' as http;
+import 'dart:convert';
 
 class DocumentFraudDetector extends StatefulWidget {
   @override
@@ -12,60 +10,26 @@ class DocumentFraudDetector extends StatefulWidget {
 }
 
 class _DocumentFraudDetectorState extends State<DocumentFraudDetector> {
-  Interpreter? _interpreter;
-  File? _selectedImage;
-  String _result = '';
-  double _confidence = 0.0;
+  File? _image;
+  Map<String, dynamic>? _result;
   bool _isLoading = false;
-  final ImagePicker _picker = ImagePicker();
 
-  @override
-  void initState() {
-    super.initState();
-    _loadModel();
-  }
-
-  // Charger le modèle TensorFlow Lite
-  Future<void> _loadModel() async {
-    try {
-      _interpreter = await Interpreter.fromAsset('fraud_detection_model.tflite');
-      print('Modèle chargé avec succès');
-    } catch (e) {
-      print('Erreur lors du chargement du modèle: $e');
-    }
-  }
-
-  // Préprocessing de l'image
-  Float32List _preprocessImage(File imageFile) {
-    // Lire l'image
-    img.Image? image = img.decodeImage(imageFile.readAsBytesSync());
-    if (image == null) throw Exception('Impossible de décoder l\'image');
-
-    // Redimensionner à 128x128 (comme votre modèle)
-    img.Image resizedImage = img.copyResize(image, width: 128, height: 128);
-
-    // Convertir en Float32List et normaliser (0-1)
-    Float32List inputBuffer = Float32List(128 * 128 * 3);
-    int pixelIndex = 0;
-
-    for (int y = 0; y < 128; y++) {
-      for (int x = 0; x < 128; x++) {
-        int pixel = resizedImage.getPixel(x, y);
-        inputBuffer[pixelIndex++] = img.getRed(pixel) / 255.0;
-        inputBuffer[pixelIndex++] = img.getGreen(pixel) / 255.0;
-        inputBuffer[pixelIndex++] = img.getBlue(pixel) / 255.0;
-      }
-    }
-
-    return inputBuffer;
-  }
-
-  // Faire la prédiction
-  Future<void> _predictImage(File imageFile) async {
-    if (_interpreter == null) {
+  Future pickImage(ImageSource src) async {
+    final picker = ImagePicker();
+    final XFile? img = await picker.pickImage(source: src);
+    if (img != null) {
       setState(() {
-        _result = 'Modèle non chargé';
+        _image = File(img.path);
+        _result = null; // Reset result when new image is selected
       });
+    }
+  }
+
+  Future uploadAndPredict() async {
+    if (_image == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Veuillez sélectionner une image')),
+      );
       return;
     }
 
@@ -74,32 +38,21 @@ class _DocumentFraudDetectorState extends State<DocumentFraudDetector> {
     });
 
     try {
-      // Préprocessing
-      Float32List input = _preprocessImage(imageFile);
+      // Remplacez par l'IP de votre serveur
+      final uri = Uri.parse('http://192.168.1.180:5000/predict');
+      var req = http.MultipartRequest('POST', uri)
+        ..files.add(await http.MultipartFile.fromPath('file', _image!.path));
       
-      // Préparer le tensor d'entrée [1, 128, 128, 3]
-      var inputTensor = input.reshape([1, 128, 128, 3]);
+      var res = await req.send();
       
-      // Préparer le tensor de sortie [1, 1]
-      var outputTensor = Float32List(1).reshape([1, 1]);
-
-      // Exécuter l'inférence
-      _interpreter!.run(inputTensor, outputTensor);
-
-      // Interpréter les résultats
-      double prediction = outputTensor[0][0];
-      
-      if prediction < 0.5) {
-        _result = 'AUTHENTIQUE';
-        _confidence = (1 - prediction) * 100;
+      if (res.statusCode == 200) {
+        final jsonRes = jsonDecode(await res.stream.bytesToString());
+        setState(() => _result = jsonRes);
       } else {
-        _result = 'FALSIFIÉ';
-        _confidence = prediction * 100;
+        setState(() => _result = {'error': 'Erreur serveur: ${res.statusCode}'});
       }
-
     } catch (e) {
-      _result = 'Erreur de prédiction: $e';
-      _confidence = 0.0;
+      setState(() => _result = {'error': 'Erreur de connexion: $e'});
     } finally {
       setState(() {
         _isLoading = false;
@@ -107,50 +60,89 @@ class _DocumentFraudDetectorState extends State<DocumentFraudDetector> {
     }
   }
 
-  // Sélectionner une image depuis la galerie
-  Future<void> _pickImageFromGallery() async {
-    final XFile? pickedFile = await _picker.pickImage(
-      source: ImageSource.gallery,
-      imageQuality: 80,
-    );
-
-    if (pickedFile != null) {
-      setState(() {
-        _selectedImage = File(pickedFile.path);
-        _result = '';
-        _confidence = 0.0;
-      });
-      await _predictImage(_selectedImage!);
+  Widget _buildResultWidget() {
+    if (_result == null) return Container();
+    
+    if (_result!.containsKey('error')) {
+      return Container(
+        padding: EdgeInsets.all(16),
+        margin: EdgeInsets.only(top: 20),
+        decoration: BoxDecoration(
+          color: Colors.red.withOpacity(0.1),
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: Colors.red),
+        ),
+        child: Text(
+          _result!['error'],
+          style: TextStyle(color: Colors.red, fontSize: 16),
+        ),
+      );
     }
-  }
 
-  // Prendre une photo avec la caméra
-  Future<void> _takePicture() async {
-    final XFile? pickedFile = await _picker.pickImage(
-      source: ImageSource.camera,
-      imageQuality: 80,
+    bool isFraud = _result!['fraud'] ?? false;
+    double prediction = _result!['prediction'] ?? 0.0;
+    double confidence = (prediction * 100);
+
+    return Container(
+      padding: EdgeInsets.all(20),
+      margin: EdgeInsets.only(top: 20),
+      decoration: BoxDecoration(
+        color: isFraud 
+            ? Colors.red.withOpacity(0.1) 
+            : Colors.green.withOpacity(0.1),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(
+          color: isFraud ? Colors.red : Colors.green,
+          width: 2,
+        ),
+      ),
+      child: Column(
+        children: [
+          Icon(
+            isFraud ? Icons.warning : Icons.verified,
+            size: 48,
+            color: isFraud ? Colors.red : Colors.green,
+          ),
+          SizedBox(height: 12),
+          Text(
+            isFraud ? 'DOCUMENT SUSPECT' : 'DOCUMENT AUTHENTIQUE',
+            style: TextStyle(
+              fontSize: 20,
+              fontWeight: FontWeight.bold,
+              color: isFraud ? Colors.red[700] : Colors.green[700],
+            ),
+          ),
+          SizedBox(height: 8),
+          Text(
+            'Score de confiance: ${confidence.toStringAsFixed(1)}%',
+            style: TextStyle(
+              fontSize: 16,
+              color: Colors.grey[700],
+            ),
+          ),
+          SizedBox(height: 12),
+          LinearProgressIndicator(
+            value: confidence / 100,
+            backgroundColor: Colors.grey[300],
+            valueColor: AlwaysStoppedAnimation<Color>(
+              isFraud ? Colors.red : Colors.green,
+            ),
+          ),
+        ],
+      ),
     );
-
-    if (pickedFile != null) {
-      setState(() {
-        _selectedImage = File(pickedFile.path);
-        _result = '';
-        _confidence = 0.0;
-      });
-      await _predictImage(_selectedImage!);
-    }
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Text('Détecteur de Faux Documents'),
-        backgroundColor: Colors.deepPurple,
+        title: Text('Fe-Detect - Détecteur de Fraude'),
+        backgroundColor: Colors.blue,
         foregroundColor: Colors.white,
       ),
       body: SingleChildScrollView(
-        padding: EdgeInsets.all(16.0),
+        padding: EdgeInsets.all(16),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
@@ -158,15 +150,17 @@ class _DocumentFraudDetectorState extends State<DocumentFraudDetector> {
             Container(
               height: 300,
               decoration: BoxDecoration(
-                border: Border.all(color: Colors.grey),
+                color: Colors.grey[200],
                 borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: Colors.grey[400]!),
               ),
-              child: _selectedImage != null
+              child: _image != null
                   ? ClipRRect(
                       borderRadius: BorderRadius.circular(12),
                       child: Image.file(
-                        _selectedImage!,
-                        fit: BoxFit.cover,
+                        _image!,
+                        fit: BoxFit.contain,
+                        width: double.infinity,
                       ),
                     )
                   : Center(
@@ -176,15 +170,14 @@ class _DocumentFraudDetectorState extends State<DocumentFraudDetector> {
                           Icon(
                             Icons.image_outlined,
                             size: 64,
-                            color: Colors.grey,
+                            color: Colors.grey[600],
                           ),
                           SizedBox(height: 16),
                           Text(
-                            'Sélectionnez ou prenez une photo\nd\'un document à analyser',
-                            textAlign: TextAlign.center,
+                            'Aucune image sélectionnée',
                             style: TextStyle(
-                              color: Colors.grey[600],
                               fontSize: 16,
+                              color: Colors.grey[600],
                             ),
                           ),
                         ],
@@ -192,27 +185,14 @@ class _DocumentFraudDetectorState extends State<DocumentFraudDetector> {
                     ),
             ),
             
-            SizedBox(height: 24),
+            SizedBox(height: 20),
             
-            // Boutons d'action
+            // Boutons de sélection d'image
             Row(
               children: [
                 Expanded(
                   child: ElevatedButton.icon(
-                    onPressed: _takePicture,
-                    icon: Icon(Icons.camera_alt),
-                    label: Text('Prendre Photo'),
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: Colors.blue,
-                      foregroundColor: Colors.white,
-                      padding: EdgeInsets.symmetric(vertical: 12),
-                    ),
-                  ),
-                ),
-                SizedBox(width: 16),
-                Expanded(
-                  child: ElevatedButton.icon(
-                    onPressed: _pickImageFromGallery,
+                    onPressed: () => pickImage(ImageSource.gallery),
                     icon: Icon(Icons.photo_library),
                     label: Text('Galerie'),
                     style: ElevatedButton.styleFrom(
@@ -222,89 +202,59 @@ class _DocumentFraudDetectorState extends State<DocumentFraudDetector> {
                     ),
                   ),
                 ),
+                SizedBox(width: 16),
+                Expanded(
+                  child: ElevatedButton.icon(
+                    onPressed: () => pickImage(ImageSource.camera),
+                    icon: Icon(Icons.camera_alt),
+                    label: Text('Caméra'),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.blue,
+                      foregroundColor: Colors.white,
+                      padding: EdgeInsets.symmetric(vertical: 12),
+                    ),
+                  ),
+                ),
               ],
             ),
             
-            SizedBox(height: 32),
+            SizedBox(height: 20),
+            
+            // Bouton d'analyse
+            ElevatedButton(
+              onPressed: _isLoading ? null : uploadAndPredict,
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.orange,
+                foregroundColor: Colors.white,
+                padding: EdgeInsets.symmetric(vertical: 16),
+              ),
+              child: _isLoading
+                  ? Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        SizedBox(
+                          width: 20,
+                          height: 20,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                          ),
+                        ),
+                        SizedBox(width: 12),
+                        Text('Analyse en cours...'),
+                      ],
+                    )
+                  : Text(
+                      'Analyser le document',
+                      style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                    ),
+            ),
             
             // Zone de résultats
-            if (_isLoading)
-              Center(
-                child: Column(
-                  children: [
-                    CircularProgressIndicator(),
-                    SizedBox(height: 16),
-                    Text('Analyse en cours...'),
-                  ],
-                ),
-              )
-            else if (_result.isNotEmpty)
-              Container(
-                padding: EdgeInsets.all(20),
-                decoration: BoxDecoration(
-                  color: _result == 'AUTHENTIQUE' 
-                      ? Colors.green.withOpacity(0.1) 
-                      : Colors.red.withOpacity(0.1),
-                  borderRadius: BorderRadius.circular(12),
-                  border: Border.all(
-                    color: _result == 'AUTHENTIQUE' 
-                        ? Colors.green 
-                        : Colors.red,
-                    width: 2,
-                  ),
-                ),
-                child: Column(
-                  children: [
-                    Icon(
-                      _result == 'AUTHENTIQUE' 
-                          ? Icons.verified 
-                          : Icons.warning,
-                      size: 48,
-                      color: _result == 'AUTHENTIQUE' 
-                          ? Colors.green 
-                          : Colors.red,
-                    ),
-                    SizedBox(height: 12),
-                    Text(
-                      _result,
-                      style: TextStyle(
-                        fontSize: 24,
-                        fontWeight: FontWeight.bold,
-                        color: _result == 'AUTHENTIQUE' 
-                            ? Colors.green[700] 
-                            : Colors.red[700],
-                      ),
-                    ),
-                    SizedBox(height: 8),
-                    Text(
-                      'Confiance: ${_confidence.toStringAsFixed(1)}%',
-                      style: TextStyle(
-                        fontSize: 18,
-                        color: Colors.grey[700],
-                      ),
-                    ),
-                    SizedBox(height: 12),
-                    LinearProgressIndicator(
-                      value: _confidence / 100,
-                      backgroundColor: Colors.grey[300],
-                      valueColor: AlwaysStoppedAnimation<Color>(
-                        _result == 'AUTHENTIQUE' ? Colors.green : Colors.red,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
+            _buildResultWidget(),
           ],
         ),
       ),
     );
   }
-
-  @override
-  void dispose() {
-    _interpreter?.close();
-    super.dispose();
-  }
 }
-
-pizhdiozeqndcfo
